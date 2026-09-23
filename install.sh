@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build disktui and install the binary.
 # From a clone:  ./install.sh
+# From the web:  curl -fsSL https://raw.githubusercontent.com/design-nexus/disktui/main/install.sh | bash
 # Optional:      ./install.sh --prefix "$HOME/.local"
 
 set -euo pipefail

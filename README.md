@@ -9,17 +9,12 @@ Disk changes go through UDisks2, the same service GNOME Disks uses. Polkit asks 
 Rust and a running UDisks2 are required. Network filesystems need their mount helpers (`cifs-utils`, `nfs-utils`, `sshfs`).
 
 ```bash
-git clone https://github.com/design-nexus/disktui.git
-cd disktui
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/design-nexus/disktui/main/install.sh | bash
 ```
 
 The binary is installed to `~/.local/bin/disktui`. Pass `--prefix` to use another directory.
 
-```bash
-cargo build --release
-./target/release/disktui
-```
+From a clone, `./install.sh` does the same build. `cargo build --release` leaves the binary at `./target/release/disktui`.
 
 `disktui /path/to/image.img` attaches that file as a loop device and selects it.
 
