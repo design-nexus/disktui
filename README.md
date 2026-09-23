@@ -22,7 +22,7 @@ From a clone, `./install.sh` does the same build. `cargo build --release` leaves
 
 The left column lists drives, partitions, free space, loop devices, RAID arrays, and network shares. The right side shows a partition map, the details of the selection, and the actions that apply to it. An action that cannot run stays visible and says why.
 
-`1` returns to disks. `2` opens network shares. `Tab` moves between the device list and the action list. `?` lists the keys. `q` quits.
+`j` and `k` move the device list, including off Network shares. The actions pane lists the commands for a disk and for network shares. `Tab` moves between the device list, the share list, and actions. `Esc` or `←` returns to the disks. `?` lists the keys. `q` quits.
 
 Destructive actions (format, delete, image restore, secure erase, NVMe sanitize, power off, write benchmark) ask you to type the kernel name, such as `nvme0n1p2`. A system disk — anything mounted at `/`, `/home`, or `/boot`, an active swap, or a volume UDisks marks as a system device — also asks you to type `system`.
 

@@ -4,11 +4,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::{Connection, MessageStream, Proxy};
+use zbus::{Connection, Proxy};
 
 use crate::model::{
     Ata, Block, ConfigItem, Drive, Job, Model, PartTable, Partition, PropVal, Raid,
@@ -28,29 +27,15 @@ pub async fn connect() -> Result<Connection> {
 }
 
 pub async fn watch(conn: Connection, tx: UnboundedSender<Msg>) {
-    let mut signals = MessageStream::from(&conn);
-    let mut debounce = tokio::time::interval(Duration::from_millis(250));
-    let mut poll = tokio::time::interval(Duration::from_secs(3));
-    let mut dirty = true;
+    // Poll the object tree. A message stream on this connection fills and then
+    // the socket reader stops, which makes every call including SMART wait.
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            _ = debounce.tick() => {
-                if dirty {
-                    match fetch(&conn).await {
-                        Ok(model) => { let _ = tx.send(Msg::Model(model)); }
-                        Err(err) => { let _ = tx.send(Msg::Error(brief(&format!("{err:#}")))); }
-                    }
-                    dirty = false;
-                }
-            }
-            _ = poll.tick() => dirty = true,
-            msg = signals.next() => {
-                match msg {
-                    Some(Ok(_)) => dirty = true,
-                    Some(Err(_)) => dirty = true,
-                    None => break,
-                }
-            }
+        tick.tick().await;
+        match fetch(&conn).await {
+            Ok(model) => { let _ = tx.send(Msg::Model(model)); }
+            Err(err) => { let _ = tx.send(Msg::Error(brief(&format!("{err:#}")))); }
         }
     }
 }

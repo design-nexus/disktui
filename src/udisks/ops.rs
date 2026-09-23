@@ -428,79 +428,163 @@ async fn loop_setup(conn: &Connection, file: &str, read_only: bool, tx: &Unbound
     Ok(format!("Attached {file}."))
 }
 
-async fn smart_text(conn: &Connection, path: &str, nvme: bool, tx: &UnboundedSender<Msg>) -> Result<String> {
+type AtaAttr = (u8, String, u16, i32, i32, i32, i64, i32, HashMap<String, OwnedValue>);
+
+async fn smart_text(_conn: &Connection, path: &str, nvme: bool, tx: &UnboundedSender<Msg>) -> Result<String> {
+    // Own socket. The app connection's reader stalls when the disk list is refreshing.
+    let conn = zbus::connection::Builder::system()
+        .context("system bus")?
+        .build()
+        .await
+        .context("system bus")?;
     let iface = if nvme { NVME } else { ATA };
-    let proxy = proxy(conn, path, iface).await?;
-    proxy
-        .call::<_, _, ()>("SmartUpdate", &empty_map())
-        .await
-        .map_err(|e| anyhow!(e))?;
-    let reply = proxy
-        .call_method("SmartGetAttributes", &empty_map())
-        .await
-        .map_err(|e| anyhow!(e))?;
-    let value: OwnedValue = reply.body().deserialize()?;
-    let text = if nvme { format_nvme(&value) } else { format_ata(&value) };
+    let proxy = proxy(&conn, path, iface).await?;
+    // NVMe health data is already refreshed on uevents. SmartUpdate blocks on a controller read.
+    if !nvme {
+        proxy
+            .call::<_, _, ()>("SmartUpdate", &empty_map())
+            .await
+            .map_err(|e| anyhow!(e))?;
+    }
+    let text = if nvme {
+        // NVMe returns a{sv}. OwnedValue expects a variant (v), so decode the dict itself.
+        let attrs: HashMap<String, OwnedValue> = proxy
+            .call("SmartGetAttributes", &empty_map())
+            .await
+            .map_err(|e| anyhow!(e))?;
+        format_nvme_map(&attrs)
+    } else {
+        let attrs: Vec<AtaAttr> = proxy
+            .call("SmartGetAttributes", &empty_map())
+            .await
+            .map_err(|e| anyhow!(e))?;
+        format_ata_rows(&attrs)
+    };
     let _ = tx.send(Msg::Smart(text));
     Ok("SMART data updated.".into())
 }
 
-fn format_ata(value: &Value) -> String {
+fn format_ata_rows(rows: &[AtaAttr]) -> String {
     let mut lines = vec!["id  attribute                         value  worst  threshold  raw".to_string()];
-    let Value::Array(array) = value else {
-        return format!("{value:?}");
-    };
-    for item in array.inner().iter() {
-        let Value::Structure(fields) = item else { continue };
-        let f: Vec<&Value> = fields.fields().iter().collect();
-        let id = match f.first().map(|v| &**v) {
-            Some(Value::U8(n)) => *n,
-            _ => 0,
-        };
-        let name = f.get(1).and_then(|v| match &**v {
-            Value::Str(s) => Some(s.as_str()),
-            _ => None,
-        }).unwrap_or("");
-        let value_n = int_at(&f, 3);
-        let worst = int_at(&f, 4);
-        let threshold = int_at(&f, 5);
-        let pretty = int_at(&f, 6);
-        lines.push(format!("{id:<3} {name:<32} {value_n:>6} {worst:>6} {threshold:>10} {pretty:>8}"));
+    for (id, name, _flags, value, worst, threshold, pretty, _unit, _) in rows {
+        lines.push(format!("{id:<3} {name:<32} {value:>6} {worst:>6} {threshold:>10} {pretty:>8}"));
+    }
+    if rows.is_empty() {
+        lines.push("No ATA SMART attributes.".into());
     }
     lines.join("\n")
 }
 
-fn int_at(fields: &[&Value], index: usize) -> i64 {
-    match fields.get(index).map(|v| &**v) {
-        Some(Value::I32(n)) => *n as i64,
-        Some(Value::I64(n)) => *n,
-        Some(Value::U64(n)) => *n as i64,
-        Some(Value::U8(n)) => *n as i64,
-        _ => -1,
+fn format_nvme_map(attrs: &HashMap<String, OwnedValue>) -> String {
+    if attrs.is_empty() {
+        return "No NVMe health attributes.".into();
+    }
+    let mut keys: Vec<&String> = attrs.keys().collect();
+    keys.sort_by(|a, b| nvme_rank(a).cmp(&nvme_rank(b)).then(a.cmp(b)));
+    let mut lines = Vec::new();
+    for key in keys {
+        let shown = nvme_value(key, &attrs[key]);
+        lines.push(format!("{:<28} {shown}", nvme_label(key)));
+    }
+    lines.join("\n")
+}
+
+fn nvme_rank(key: &str) -> usize {
+    [
+        "avail_spare",
+        "spare_thresh",
+        "percent_used",
+        "wctemp",
+        "cctemp",
+        "temp_sensors",
+        "media_errors",
+        "num_err_log_entries",
+        "power_cycles",
+        "unsafe_shutdowns",
+        "ctrl_busy_time",
+        "warning_temp_time",
+        "critical_temp_time",
+        "total_data_read",
+        "total_data_written",
+    ]
+    .iter()
+    .position(|name| *name == key)
+    .unwrap_or(100)
+}
+
+fn nvme_label(key: &str) -> &str {
+    match key {
+        "avail_spare" => "Available spare",
+        "spare_thresh" => "Spare threshold",
+        "percent_used" => "Percent used",
+        "total_data_read" => "Data read",
+        "total_data_written" => "Data written",
+        "ctrl_busy_time" => "Controller busy",
+        "power_cycles" => "Power cycles",
+        "unsafe_shutdowns" => "Unsafe shutdowns",
+        "media_errors" => "Media errors",
+        "num_err_log_entries" => "Error log entries",
+        "temp_sensors" => "Temperature sensors",
+        "wctemp" => "Warning temperature",
+        "cctemp" => "Critical temperature",
+        "warning_temp_time" => "Warning temperature time",
+        "critical_temp_time" => "Critical temperature time",
+        other => other,
     }
 }
 
-fn format_nvme(value: &Value) -> String {
-    let Value::Dict(dict) = value else {
-        return format!("{value:?}");
-    };
-    let mut lines = Vec::new();
-    for (key, raw) in dict.iter() {
-        let key = match key {
-            Value::Str(s) => s.as_str().to_string(),
-            other => format!("{other:?}"),
-        };
-        let shown = match raw {
-            Value::Value(inner) => scalar(inner),
-            other => scalar(other),
-        };
-        lines.push(format!("{key}: {shown}"));
+fn nvme_value(key: &str, raw: &OwnedValue) -> String {
+    let value = unwrap_value(raw);
+    match key {
+        "avail_spare" | "spare_thresh" | "percent_used" => match number(value) {
+            Some(n) => format!("{n}%"),
+            None => scalar(value),
+        },
+        "total_data_read" | "total_data_written" => match number(value) {
+            Some(n) => human_size(n as u64),
+            None => scalar(value),
+        },
+        "power_cycles" | "unsafe_shutdowns" | "media_errors" | "num_err_log_entries" => match number(value) {
+            Some(n) => n.to_string(),
+            None => scalar(value),
+        },
+        "ctrl_busy_time" | "warning_temp_time" | "critical_temp_time" => match number(value) {
+            Some(n) => format!("{n} min"),
+            None => scalar(value),
+        },
+        "wctemp" | "cctemp" => kelvin(value),
+        "temp_sensors" => match value {
+            Value::Array(array) => array.inner().iter().map(kelvin).collect::<Vec<_>>().join(", "),
+            other => kelvin(other),
+        },
+        _ => scalar(value),
     }
-    lines.sort();
-    if lines.is_empty() {
-        "No NVMe health attributes.".into()
-    } else {
-        lines.join("\n")
+}
+
+fn unwrap_value<'a>(value: &'a Value<'a>) -> &'a Value<'a> {
+    match value {
+        Value::Value(inner) => unwrap_value(inner),
+        other => other,
+    }
+}
+
+fn number(value: &Value) -> Option<i64> {
+    match unwrap_value(value) {
+        Value::U8(n) => Some(*n as i64),
+        Value::U16(n) => Some(*n as i64),
+        Value::U32(n) => Some(*n as i64),
+        Value::U64(n) => Some(*n as i64),
+        Value::I16(n) => Some(*n as i64),
+        Value::I32(n) => Some(*n as i64),
+        Value::I64(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn kelvin(value: &Value) -> String {
+    match number(value) {
+        Some(n) if n > 0 => format!("{} °C", n - 273),
+        _ => "n/a".into(),
     }
 }
 
@@ -509,7 +593,7 @@ fn scalar(value: &Value) -> String {
         Value::U8(n) => n.to_string(),
         Value::U16(n) => n.to_string(),
         Value::U32(n) => n.to_string(),
-        Value::U64(n) => human_size(*n).contains("B").then(|| human_size(*n)).unwrap_or_else(|| n.to_string()),
+        Value::U64(n) => n.to_string(),
         Value::I32(n) => n.to_string(),
         Value::I64(n) => n.to_string(),
         Value::Bool(n) => n.to_string(),
@@ -623,6 +707,7 @@ fn transfer_device(
         let _ = tx.send(Msg::Progress(Some(Progress {
             label: format!("{label}  {mbps:.0} MB/s"),
             ratio,
+            cancel: true,
         })));
         if n < CHUNK {
             break;
@@ -664,6 +749,7 @@ fn copy_streams(
         let _ = tx.send(Msg::Progress(Some(Progress {
             label: format!("{label}  {mbps:.0} MB/s"),
             ratio,
+            cancel: true,
         })));
     }
     if restore {
@@ -741,6 +827,24 @@ async fn call_string(
     options: &HashMap<String, OwnedValue>,
 ) -> Result<String> {
     call_ret(conn, path, iface, method, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvme_attributes_are_readable() {
+        let mut attrs = HashMap::new();
+        attrs.insert("percent_used".into(), super::super::owned(7u8).unwrap());
+        attrs.insert("total_data_read".into(), super::super::owned(1_500_000_000u64).unwrap());
+        attrs.insert("wctemp".into(), super::super::owned(353u16).unwrap());
+        let text = format_nvme_map(&attrs);
+        assert!(text.contains("Percent used"), "{text}");
+        assert!(text.contains("7%"), "{text}");
+        assert!(text.contains("1.5 GB"), "{text}");
+        assert!(text.contains("80 °C"), "{text}");
+    }
 }
 
 

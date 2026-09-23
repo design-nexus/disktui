@@ -121,6 +121,7 @@ pub struct App {
     pub samples: Vec<(f64, f64)>,
     pub quit: bool,
     pub busy: bool,
+    pub busy_tick: u64,
     pub cancel: Arc<AtomicBool>,
     pub pending: Effect,
     pub attach: Option<String>,
@@ -165,6 +166,7 @@ impl App {
             samples: Vec::new(),
             quit: false,
             busy: false,
+            busy_tick: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             pending: Effect::None,
             attach,
@@ -224,6 +226,8 @@ impl App {
             Msg::Progress(progress) => self.progress = progress,
             Msg::Sample { pos, mbps } => self.samples.push((pos, mbps)),
             Msg::Smart(text) => {
+                self.progress = None;
+                self.busy = false;
                 self.dialog = Dialog::Text {
                     title: "SMART".into(),
                     body: text,
@@ -258,7 +262,7 @@ impl App {
     }
 
     fn key_main(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc && self.progress.is_some() {
+        if key.code == KeyCode::Esc && self.progress.as_ref().is_some_and(|progress| progress.cancel) {
             self.cancel.store(true, Ordering::Relaxed);
             self.info = "Cancelling…".into();
             return;
@@ -267,6 +271,9 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('t') => self.open_themes(),
+            KeyCode::Esc | KeyCode::Left if self.focus == Focus::Shares => {
+                self.focus = Focus::Devices;
+            }
             KeyCode::Char('1') => {
                 self.focus = Focus::Devices;
                 if matches!(self.current_kind(), Some(RowKind::Shares)) {
@@ -290,25 +297,16 @@ impl App {
     }
 
     fn cycle(&mut self, dir: i32) {
-        self.focus = match (self.focus, dir > 0) {
-            (Focus::Devices, true) => {
-                if matches!(self.current_kind(), Some(RowKind::Shares)) {
-                    Focus::Shares
-                } else {
-                    Focus::Actions
-                }
+        let shares = matches!(self.current_kind(), Some(RowKind::Shares));
+        let forward = dir > 0;
+        self.focus = if !shares {
+            if self.focus == Focus::Devices { Focus::Actions } else { Focus::Devices }
+        } else {
+            match (self.focus, forward) {
+                (Focus::Devices, true) | (Focus::Actions, false) => Focus::Shares,
+                (Focus::Shares, true) | (Focus::Devices, false) => Focus::Actions,
+                (Focus::Actions, true) | (Focus::Shares, false) => Focus::Devices,
             }
-            (Focus::Actions, true) => Focus::Devices,
-            (Focus::Shares, true) => Focus::Devices,
-            (Focus::Devices, false) => {
-                if matches!(self.current_kind(), Some(RowKind::Shares)) {
-                    Focus::Shares
-                } else {
-                    Focus::Actions
-                }
-            }
-            (Focus::Actions, false) => Focus::Devices,
-            (Focus::Shares, false) => Focus::Devices,
         };
     }
 
@@ -322,7 +320,13 @@ impl App {
                 self.action_index = slide(self.action_index, len, dir);
             }
             Focus::Shares => {
+                let at_top = self.shares.is_empty() || self.share_index == 0;
+                if dir < 0 && at_top {
+                    self.leave_shares(true);
+                    return;
+                }
                 if self.shares.is_empty() {
+                    self.leave_shares(false);
                     return;
                 }
                 self.share_index = slide(self.share_index, self.shares.len(), dir);
@@ -333,9 +337,6 @@ impl App {
                 }
                 self.selected = slide(self.selected, self.rows.len(), dir);
                 self.action_index = 0;
-                if matches!(self.current_kind(), Some(RowKind::Shares)) {
-                    self.focus = Focus::Shares;
-                }
             }
         }
     }
@@ -352,7 +353,7 @@ impl App {
                     }
                 }
             }
-            Focus::Shares => self.open_share(false),
+            Focus::Shares => self.open_share(self.shares.is_empty()),
             Focus::Devices => match self.current_kind() {
                 Some(RowKind::Shares) => self.focus = Focus::Shares,
                 Some(RowKind::Free { .. }) => self.open_action(ActionId::CreatePartition),
@@ -371,17 +372,6 @@ impl App {
     }
 
     fn shortcut(&mut self, ch: char) {
-        if self.focus == Focus::Shares {
-            match ch {
-                'n' => self.open_share(true),
-                'e' => self.open_share(false),
-                'd' => self.delete_share(),
-                'm' => self.mount_share(true),
-                'u' => self.mount_share(false),
-                _ => {}
-            }
-            return;
-        }
         let Some(action) = self.actions().into_iter().find(|action| action.id.key() == ch.to_string() && !action.id.key().is_empty()) else {
             return;
         };
@@ -514,6 +504,16 @@ impl App {
     }
 
     pub fn actions(&self) -> Vec<model::Action> {
+        if matches!(self.current_kind(), Some(RowKind::Shares)) {
+            let has = !self.shares.is_empty();
+            return vec![
+                share_action(ActionId::NewShare, true, ""),
+                share_action(ActionId::EditShare, has, "No share selected"),
+                share_action(ActionId::RemoveShare, has, "No share selected"),
+                share_action(ActionId::MountShare, has, "No share selected"),
+                share_action(ActionId::UnmountShare, has, "No share selected"),
+            ];
+        }
         let Some(row) = self.rows.get(self.selected) else {
             return Vec::new();
         };
@@ -648,6 +648,11 @@ impl App {
             ActionId::HeaderBackup => self.form_header(false),
             ActionId::RestoreHeader => self.form_header(true),
             ActionId::ConvertLuks => self.form_convert(),
+            ActionId::NewShare => self.open_share(true),
+            ActionId::EditShare => self.open_share(false),
+            ActionId::RemoveShare => self.delete_share(),
+            ActionId::MountShare => self.mount_share(true),
+            ActionId::UnmountShare => self.mount_share(false),
         }
     }
 
@@ -1073,6 +1078,12 @@ impl App {
             }
             other => other,
         };
+        let cancel = matches!(op, Op::Benchmark { .. } | Op::Backup { .. } | Op::Restore { .. });
+        self.progress = Some(Progress {
+            label: op_label(&op).into(),
+            ratio: -1.0,
+            cancel,
+        });
         self.pending = Effect::Call(op);
     }
 
@@ -1128,7 +1139,16 @@ impl App {
         if let Some(index) = self.rows.iter().position(|r| matches!(r.kind, RowKind::Shares)) {
             self.selected = index;
         }
-        self.focus = Focus::Shares;
+        self.focus = Focus::Devices;
+        self.action_index = 0;
+    }
+
+    fn leave_shares(&mut self, step_up: bool) {
+        self.focus = Focus::Devices;
+        if step_up && self.selected > 0 {
+            self.selected -= 1;
+            self.action_index = 0;
+        }
     }
 
     fn open_share(&mut self, fresh: bool) {
@@ -1268,6 +1288,44 @@ fn row_key(row: &Row) -> String {
         RowKind::Free { disk, start, .. } => format!("f:{disk}:{start}"),
         RowKind::Raid { raid } => format!("r:{raid}"),
         RowKind::Shares => "shares".into(),
+    }
+}
+
+fn share_action(id: ActionId, enabled: bool, reason: &str) -> model::Action {
+    model::Action {
+        id,
+        enabled,
+        reason: if enabled { String::new() } else { reason.into() },
+    }
+}
+
+fn op_label(op: &Op) -> &'static str {
+    match op {
+        Op::Smart { .. } => "Reading SMART data",
+        Op::SmartTest { .. } => "Starting SMART self-test",
+        Op::SmartAbort { .. } => "Aborting SMART self-test",
+        Op::Mount(_) => "Mounting",
+        Op::Unmount { .. } => "Unmounting",
+        Op::Format(_) => "Formatting",
+        Op::CreatePartition(_) => "Creating partition",
+        Op::DeletePartition { .. } => "Deleting partition",
+        Op::Resize { .. } => "Resizing",
+        Op::Check(_) => "Checking filesystem",
+        Op::Repair(_) => "Repairing filesystem",
+        Op::Benchmark { write: true, .. } => "Writing benchmark",
+        Op::Benchmark { .. } => "Reading benchmark",
+        Op::Backup { .. } => "Creating disk image",
+        Op::Restore { .. } => "Restoring disk image",
+        Op::Unlock { .. } => "Unlocking",
+        Op::Lock(_) => "Locking",
+        Op::PowerOff(_) => "Powering off",
+        Op::Eject(_) => "Ejecting",
+        Op::SecureErase { .. } => "Secure erase",
+        Op::Sanitize { .. } => "NVMe sanitize",
+        Op::Rescan(_) => "Rescanning",
+        Op::LoopSetup { .. } => "Attaching disk image",
+        Op::LoopDelete(_) => "Detaching loop",
+        _ => "Working",
     }
 }
 

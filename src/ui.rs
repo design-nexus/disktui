@@ -30,13 +30,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_main(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let [list_area, detail_area] = Layout::horizontal([Constraint::Length(34), Constraint::Min(24)]).areas(area);
     draw_devices(frame, app, theme, list_area);
+    let [top, actions] = Layout::vertical([Constraint::Min(8), Constraint::Length(12)]).areas(detail_area);
     if matches!(app.current_row(), Some(RowKind::Shares)) || app.focus == Focus::Shares {
-        draw_shares(frame, app, theme, detail_area);
+        draw_shares(frame, app, theme, top);
     } else {
-        let [top, actions] = Layout::vertical([Constraint::Min(8), Constraint::Length(12)]).areas(detail_area);
         draw_detail(frame, app, theme, top);
-        draw_actions(frame, app, theme, actions);
     }
+    draw_actions(frame, app, theme, actions);
 }
 
 fn draw_devices(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -128,18 +128,18 @@ fn draw_actions(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn draw_shares(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let block = panel("Network shares", app.focus == Focus::Shares, theme);
-    let mut lines = vec![Line::from(Span::styled(
-        "n new   e edit   d remove   m mount   u unmount",
-        Style::default().fg(theme.muted),
-    ))];
+    let editing = app.focus == Focus::Shares;
+    let block = panel("Network shares", editing, theme);
+    let mut lines = Vec::new();
     if app.shares.is_empty() {
         lines.push(Line::from("No network shares in /etc/fstab."));
-        lines.push(Line::from("Press n to add SMB, NFS, or SSHFS. Other lines in fstab are left untouched."));
+        lines.push(Line::from("Use New share below. Other lines in fstab are left untouched."));
     }
     for (index, share) in app.shares.iter().enumerate() {
-        let style = if index == app.share_index && app.focus == Focus::Shares {
+        let style = if index == app.share_index && editing {
             theme.selected()
+        } else if index == app.share_index {
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.fg)
         };
@@ -163,17 +163,28 @@ fn draw_dialog(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             let block = panel(&form.title, true, theme);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
+            let [body, hint] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
             let mut lines = Vec::new();
             if !form.blurb.is_empty() {
                 lines.push(Line::from(Span::styled(form.blurb.clone(), Style::default().fg(theme.muted))));
                 lines.push(Line::from(""));
             }
+            let width = body.width as usize;
             for (index, field) in form.fields.iter().enumerate() {
-                lines.push(field_line(field, index == form.focus, theme));
+                lines.push(field_line(field, index == form.focus, width, theme));
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("Enter confirms   Esc cancels   ← → changes a choice", Style::default().fg(theme.muted))));
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            let prefix = if form.blurb.is_empty() { 0 } else { 2 };
+            let row = prefix + form.focus;
+            let height = body.height as usize;
+            let scroll = row.saturating_sub(height.saturating_sub(1)) as u16;
+            frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "Enter confirms   Esc cancels   ← → changes a choice",
+                    Style::default().fg(theme.muted),
+                )),
+                hint,
+            );
         }
         Dialog::Confirm(confirm) => {
             let block = panel(&confirm.title, true, theme);
@@ -224,15 +235,18 @@ fn draw_themes(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
 fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
     let text = "\
-Devices          j/k or arrows move, Enter mounts, unmounts, or unlocks
+Devices          j/k or arrows move. Enter mounts, unmounts, or unlocks
 Actions          Tab, then Enter. The letter at the left runs that action
 m mount/unlock   u unmount   U force unmount   e mount options
 n new partition  f format    d delete          r resize    l label
-s SMART          b benchmark i image           I restore   p power off
-g drive settings a attach image                t theme     x cancel job
-1 disks          2 network shares              ? help      q quit
+s SMART data     c self-test   b benchmark     i create image
+o restore image  p power off   g drive settings  a attach image
+t theme          x cancel job  2 network shares  ? help
+q quit           1 first disk
 
-Shares           n new  e edit  d remove  m mount  u unmount
+Shares           The actions pane lists the commands, same as a disk.
+                 Tab moves between disks, the share list, and actions.
+                 Esc or ← returns to the disks. ↑ on the first share does too.
 Destructive work asks you to type the kernel name. A system disk also asks for the word system.
 Network shares are written to /etc/fstab with sudo. Every other line is copied through unchanged.
 Esc closes a dialog. Esc during a benchmark or image copy cancels it.
@@ -245,21 +259,80 @@ fn draw_status(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let (text, style) = if !app.error.is_empty() {
         (app.error.clone(), Style::default().fg(theme.red).bg(theme.bg_deep))
     } else if let Some(progress) = &app.progress {
-        (
-            format!("{}  {:3.0}%", progress.label, progress.ratio * 100.0),
-            Style::default().fg(theme.accent).bg(theme.bg_deep),
-        )
+        let label = if progress.cancel {
+            format!("{}    Esc cancels", progress.label)
+        } else {
+            progress.label.clone()
+        };
+        let line = progress_line(&label, progress.ratio, app.busy_tick, area.width, theme);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
     } else if let Some(job) = app.model.jobs.first() {
-        let pct = if job.progress_valid { format!(" {:3.0}%", job.progress * 100.0) } else { String::new() };
-        (format!("{}{pct}  x cancel", job.operation), theme.status())
+        let ratio = if job.progress_valid { job.progress } else { -1.0 };
+        let label = if job.cancelable {
+            format!("{}    x cancel", job.operation)
+        } else {
+            job.operation.clone()
+        };
+        let line = progress_line(&label, ratio, app.busy_tick, area.width, theme);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
     } else if !app.info.is_empty() {
         (app.info.clone(), theme.status())
     } else if !app.samples.is_empty() {
         (sparkline(&app.samples, area.width.saturating_sub(2) as usize), theme.status())
     } else {
-        ("? help   q quit   t theme   2 shares".into(), theme.status())
+        (
+            if app.focus == Focus::Shares {
+                "↑↓ shares    Tab actions    Esc disks".into()
+            } else if matches!(app.current_row(), Some(RowKind::Shares)) && app.focus == Focus::Actions {
+                "letter runs the action    Tab share list    Esc disks".into()
+            } else if matches!(app.current_row(), Some(RowKind::Shares)) {
+                "↑↓ disks    Tab shares    ? help    q quit".into()
+            } else {
+                "? help   q quit   t theme   2 shares".into()
+            },
+            theme.status(),
+        )
     };
     frame.render_widget(Paragraph::new(text).style(style), area);
+}
+
+fn progress_line(label: &str, ratio: f64, tick: u64, width: u16, theme: &Theme) -> Line<'static> {
+    let label_width = label.chars().count() as u16 + 2;
+    let bar_w = width.saturating_sub(label_width + 6).clamp(8, 24);
+    let mut spans = vec![Span::styled(
+        format!("{label}  "),
+        Style::default().fg(theme.fg).bg(theme.bg_deep),
+    )];
+    let filled = if ratio < 0.0 {
+        None
+    } else {
+        Some(((ratio.clamp(0.0, 1.0) * f64::from(bar_w)).round() as u16).min(bar_w))
+    };
+    let window = (tick as u16) % bar_w.max(1);
+    for i in 0..bar_w {
+        let on = match filled {
+            Some(n) => i < n,
+            None => {
+                let end = window + 4;
+                (i >= window && i < end) || (end > bar_w && i < end % bar_w)
+            }
+        };
+        spans.push(Span::styled(
+            "█",
+            Style::default()
+                .fg(if on { theme.accent } else { theme.bg_raised })
+                .bg(theme.bg_deep),
+        ));
+    }
+    if ratio >= 0.0 {
+        spans.push(Span::styled(
+            format!(" {:3.0}%", ratio * 100.0),
+            Style::default().fg(theme.accent).bg(theme.bg_deep),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn detail_title(app: &App) -> String {
@@ -420,8 +493,8 @@ fn volume_lines(lines: &mut Vec<Line<'static>>, app: &App, block: &model::Block,
     }
 }
 
-fn field_line(field: &Field, focused: bool, theme: &Theme) -> Line<'static> {
-    let value = if field.secret {
+fn field_line(field: &Field, focused: bool, width: usize, theme: &Theme) -> Line<'static> {
+    let mut value = if field.secret {
         "•".repeat(field.value.chars().count())
     } else if field.toggle {
         if field.value == "yes" { "[x]".into() } else { "[ ]".into() }
@@ -430,11 +503,19 @@ fn field_line(field: &Field, focused: bool, theme: &Theme) -> Line<'static> {
     } else {
         field.value.clone()
     };
-    let style = if focused { theme.selected() } else { Style::default().fg(theme.fg) };
-    Line::from(vec![
-        Span::styled(format!("{:<16}", field.label), Style::default().fg(theme.muted)),
-        Span::styled(value, style),
-    ])
+    if focused && field.choices.is_empty() && !field.toggle {
+        value.push('█');
+    }
+    let text = format!("{:<16}{value}", field.label);
+    if focused {
+        let pad = width.max(text.chars().count());
+        Line::from(Span::styled(format!("{text:<pad$}"), theme.selected()))
+    } else {
+        Line::from(vec![
+            Span::styled(format!("{:<16}", field.label), Style::default().fg(theme.muted)),
+            Span::styled(value, Style::default().fg(theme.fg)),
+        ])
+    }
 }
 
 fn typed_line(label: &str, value: &str, focused: bool, theme: &Theme) -> Line<'static> {

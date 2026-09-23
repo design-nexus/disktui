@@ -91,6 +91,9 @@ async fn run(
     loop {
         terminal.draw(|frame| ui::draw(frame, app)).context("draw")?;
         tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(80)), if app.busy => {
+                app.busy_tick = app.busy_tick.wrapping_add(1);
+            }
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) => {

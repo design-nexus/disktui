@@ -4,6 +4,8 @@ use crate::model::{Caps, Model};
 pub struct Progress {
     pub label: String,
     pub ratio: f64,
+    /// Esc stops this operation. SMART and other D-Bus calls are not stopped this way.
+    pub cancel: bool,
 }
 
 pub enum Msg {

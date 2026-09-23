@@ -239,6 +239,11 @@ pub enum ActionId {
     RaidStop,
     RaidDelete,
     Rescan,
+    NewShare,
+    EditShare,
+    RemoveShare,
+    MountShare,
+    UnmountShare,
 }
 
 impl ActionId {
@@ -254,10 +259,16 @@ impl ActionId {
             Self::Resize => "r",
             Self::EditPartition => "P",
             Self::Check | Self::Repair => "",
-            Self::Smart | Self::SmartTest => "s",
+            Self::Smart => "s",
+            Self::SmartTest => "c",
             Self::Benchmark => "b",
             Self::CreateImage => "i",
-            Self::RestoreImage => "I",
+            Self::RestoreImage => "o",
+            Self::NewShare => "n",
+            Self::EditShare => "e",
+            Self::RemoveShare => "d",
+            Self::MountShare => "m",
+            Self::UnmountShare => "u",
             Self::PowerOff => "p",
             Self::AttachImage => "a",
             Self::DriveSettings => "g",
@@ -309,6 +320,11 @@ impl ActionId {
             Self::RaidStop => "Stop RAID",
             Self::RaidDelete => "Delete RAID",
             Self::Rescan => "Rescan",
+            Self::NewShare => "New share",
+            Self::EditShare => "Edit share",
+            Self::RemoveShare => "Remove share",
+            Self::MountShare => "Mount share",
+            Self::UnmountShare => "Unmount share",
         }
     }
 }
@@ -1190,5 +1206,15 @@ mod tests {
             drive: "/drives/d".into()
         }));
         assert!(model.row_is_system(&RowKind::Volume { block: "/p".into() }));
+    }
+
+    #[test]
+    fn paired_actions_do_not_share_a_key() {
+        let distinct = |a: ActionId, b: ActionId| {
+            assert_ne!(a.key(), b.key());
+            assert_ne!(a.key().to_ascii_lowercase(), b.key().to_ascii_lowercase());
+        };
+        distinct(ActionId::Smart, ActionId::SmartTest);
+        distinct(ActionId::CreateImage, ActionId::RestoreImage);
     }
 }
